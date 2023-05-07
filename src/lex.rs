@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::error;
 
 // get the last char and write to buffer and delete it if condition satisfied
@@ -58,8 +58,15 @@ const KEYWORDS: [&str; 31] = [
     "restrict",
 ];
 
-const OPERATORS: [char; 16] = [
-    '+', '-', '*', '>', '<', '^', '%', '!', '=', '~', '|', '&', '(', '[', ',', '.',
+// operator 指的是将多个值进行运算并返回一个新值的符号
+const OPERATORS_VALID: [&str; 39] = [
+    "+", "-", "*", "/", "%", "++", "--", // 算术运算符
+    "!=", "==", ">", "<", ">=", "<=", // 关系运算符
+    "||", "&&", "!", // 逻辑运算符
+    "^", ">>", "<<", "|", "&", "~", // 位运算符
+    "=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "^=", "|=", // 赋值运算符
+    "?",  // 三元运算符
+    "->", "(", "[", ",", ".", // * 也可以是地址操作符；不支持 & 取地址
 ];
 
 const SYMBOLS: [char; 8] = ['{', '}', ':', ';', '#', '\\', ')', ']'];
@@ -116,7 +123,9 @@ trait LexParser {
     fn get_tokens(&self) -> &Vec<Token>;
     fn get_last_token(&mut self) -> Option<&mut Token>;
 
-    fn error(&self, err: anyhow::Error) -> String;
+    fn error_string(&self, err: anyhow::Error) -> String;
+    fn error(&self, s: &str) -> anyhow::Error;
+
     fn copy_position(&self) -> Pos;
 }
 
@@ -125,7 +134,10 @@ struct Lexer<'a> {
     /// operators can be combined such as "<<" or ">>"
     // technically brackets are operator, but when we found a symbol ')' we known operator '('
     // done. that's why we put ')' in symbols
-    operators: HashSet<char>,
+    operators_lead_char: HashSet<char>,
+    operators_as_one: HashSet<char>,
+    operators_following_chars: HashSet<char>,
+    operators_valid: HashSet<&'a str>,
     symbols: HashSet<char>,
 }
 
@@ -142,71 +154,40 @@ struct FileLexer {
     tokens: Vec<Token>,
 }
 
-impl LexParser for FileLexer {
-    fn next_char(&mut self) -> Option<char> {
-        if !self.check_line_or_read() {
-            return None;
-        }
-
-        match self.current_line.pop() {
-            Some(c) if c == '\n' => {
-                self.pos.line += 1;
-                self.pos.col = 0;
-                Some('\n')
-            }
-            Some(c) => {
-                self.pos.col += 1;
-                Some(c)
-            }
-            None => {
-                panic!("BUG: pop a empty string, it should be returned before")
-            }
-        }
-    }
-
-    fn peek_char(&mut self) -> Option<char> {
-        if !self.check_line_or_read() {
-            return None;
-        }
-        self.current_line.chars().last()
-    }
-
-    fn push_char(&mut self, c: char) {
-        self.current_line.push(c)
-    }
-
-    fn copy_position(&self) -> Pos {
-        self.pos.clone()
-    }
-
-    fn error(&self, err: anyhow::Error) -> String {
-        format!(
-            "on line {}, col {} in file {}, {}",
-            self.pos.line,
-            self.pos.col,
-            self.pos.filename.to_string_lossy().to_string(),
-            err,
-        )
-    }
-
-    fn push_token(&mut self, t: Token) {
-        self.tokens.push(t)
-    }
-
-    fn get_tokens(&self) -> &Vec<Token> {
-        &self.tokens
-    }
-
-    fn get_last_token(&mut self) -> Option<&mut Token> {
-        self.tokens.last_mut()
-    }
-}
-
 impl<'a> Lexer<'a> {
     pub fn new() -> Self {
+        // operators' lead chars, such as '+' to '+='
+        let operators_lead_char = OPERATORS_VALID
+            .into_iter()
+            .map(|s| s.chars().next().expect("BUG: str in operators is empty"))
+            .collect::<HashSet<char>>();
+
+        // lead chars which cannot be merged together; it retrieve from OPERATORS_VALID's char pairs which only
+        // shows in single char
+        let operators_as_one = operators_lead_char
+            .iter()
+            .map(|c| *c)
+            .filter(|c| {
+                //c not in a string which len > 2 in OPERATORS_VALID;
+                OPERATORS_VALID
+                    .into_iter()
+                    .filter(|st| st.len() > 1)
+                    .any(|st| st.chars().find(|stc| stc == c).is_some())
+            })
+            .collect::<HashSet<char>>();
+
+        let operators_following_chars = OPERATORS_VALID
+            .into_iter()
+            .flat_map(|x| x.chars().skip(1))
+            .collect::<HashSet<char>>();
         Self {
             keywords: HashSet::from(KEYWORDS),
-            operators: HashSet::from(OPERATORS),
+
+            operators_valid: HashSet::from(OPERATORS_VALID),
+            operators_lead_char,
+            operators_as_one,
+            operators_following_chars,
+
             symbols: HashSet::from(SYMBOLS),
         }
     }
@@ -223,7 +204,7 @@ impl<'a> Lexer<'a> {
             if Self::is_digit(c) {
                 match self.make_num_token(parser) {
                     Err(e) => {
-                        error!("make num token failed: {}", parser.error(e));
+                        error!("make num token failed: {}", parser.error_string(e));
                         return None;
                     }
                     Ok(t) => {
@@ -232,7 +213,25 @@ impl<'a> Lexer<'a> {
                 }
             }
 
-            if c.is_whitespace() {}
+            if c.is_whitespace() {
+                return self.handle_whitespace(parser);
+            }
+
+            if c == '"' {
+                match self.make_string_token(parser, '"', '"') {
+                    Err(e) => {
+                        error!("make string token failed: {}", parser.error_string(e));
+                        return None;
+                    }
+                    Ok(t) => {
+                        return Some(t);
+                    }
+                }
+            }
+
+            if self.operators_lead_char.contains(&c) {
+                todo!()
+            }
         }
         None
     }
@@ -250,25 +249,103 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    // parse whitespaces
-    fn make_whitespace_token<T: LexParser>(&self, parser: &mut T) -> Result<Token> {
+    fn make_string_token<T: LexParser>(
+        &self,
+        parser: &mut T,
+        start_delim: char,
+        end_delim: char,
+    ) -> Result<Token> {
+        assert_eq!(Some(start_delim), parser.next_char());
         let mut buf = String::new();
         let p = parser.copy_position();
-        lex_getc_if!(parser, Self::is_whitespace, buf);
+        while let Some(c) = parser.peek_char() {
+            if c == end_delim {
+                break;
+            }
+            // ignore escape
+            if c == '\\' {
+                continue;
+            }
+            buf.write_char(c)?;
+            parser.next_char();
+        }
+        assert_eq!(Some(end_delim), parser.next_char());
 
         Ok(Token {
-            tv: TokenTypeAndValue::(Num::ULongLongInt(buf.parse()?)),
+            tv: TokenTypeAndValue::Str(buf),
             pos: p,
             whitespace_tail: false,
         })
     }
 
-    fn is_digit(c: char) -> bool {
-        ('0'..='9').contains(&c)
+    fn make_operator_token(&self, s: &str) -> Result<Token> {
+        unimplemented!()
     }
 
-    fn is_whitespace(c: char) -> bool {
-        c.is_whitespace()
+    fn read_op<T: LexParser>(&self, parser: &mut T) -> Result<Token> {
+        let mut buf = String::new();
+
+        let op = parser
+            .next_char()
+            .expect("BUG: call read operator while encountering EOF");
+
+        buf.write_char(op)?;
+
+        while !self.operators_as_one.contains(&op) {
+            let op = match parser.peek_char() {
+                Some(c) => c,
+                None => return Err(parser.error("invalid single char operator")),
+            };
+            if self.operators_following_chars.contains(&op) {
+                buf.write_char(op)?;
+                parser.next_char();
+            }
+        }
+
+        // push back the elems until operator is valid
+        // 最长匹配法
+        // 找到那个valid的operator的buf[:i], 使得i最大
+        let mut buf_str = buf.as_str();
+        // last值是最后一个被push回去的char的index
+        if let Some(i) = buf
+            .chars()
+            .rev()
+            .enumerate()
+            .take_while(|(i, _)| !self.operators_valid.contains(&buf_str[..buf_str.len() - i]))
+            .map(|(i, c)| {
+                parser.push_char(c);
+                buf_str.len() - i - 1
+            })
+            .last()
+        {
+            // i 是 1 说明 整个buf都被push回去了, 还是没找到合理的op
+            if i == 0 {
+                return Err(parser.error("invalid operator"));
+            }
+            // i 是其他 表示有部分不满足被push回去了，但buf[:i]之间是满足的
+            buf_str = &buf_str[..i];
+        }
+        return self.make_operator_token(buf_str);
+    }
+
+    fn handle_whitespace<T: LexParser>(&self, parser: &mut T) -> Option<Token> {
+        parser.get_last_token().map(|t| {
+            t.whitespace_tail = true;
+        });
+
+        parser.next_char();
+        while let Some(c) = parser.peek_char() {
+            if !c.is_whitespace() {
+                break;
+            }
+            parser.next_char();
+        }
+
+        return self.next_token(parser);
+    }
+
+    fn is_digit(c: char) -> bool {
+        ('0'..='9').contains(&c)
     }
 
     fn is_identifier(c: char) -> bool {
@@ -316,6 +393,75 @@ impl FileLexer {
             };
         }
         true
+    }
+}
+
+impl LexParser for FileLexer {
+    fn next_char(&mut self) -> Option<char> {
+        if !self.check_line_or_read() {
+            return None;
+        }
+
+        match self.current_line.pop() {
+            Some(c) if c == '\n' => {
+                self.pos.line += 1;
+                self.pos.col = 0;
+                Some('\n')
+            }
+            Some(c) => {
+                self.pos.col += 1;
+                Some(c)
+            }
+            None => {
+                panic!("BUG: pop a empty string, it should be returned before")
+            }
+        }
+    }
+
+    fn peek_char(&mut self) -> Option<char> {
+        if !self.check_line_or_read() {
+            return None;
+        }
+        self.current_line.chars().last()
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.current_line.push(c)
+    }
+
+    fn copy_position(&self) -> Pos {
+        self.pos.clone()
+    }
+
+    fn error_string(&self, err: anyhow::Error) -> String {
+        format!(
+            "on line {}, col {} in file {}, {}",
+            self.pos.line,
+            self.pos.col,
+            self.pos.filename.to_string_lossy().to_string(),
+            err,
+        )
+    }
+
+    fn error(&self, s: &str) -> anyhow::Error {
+        anyhow!(format!(
+            "on line {}, col {} in file {}, {}",
+            self.pos.line,
+            self.pos.col,
+            self.pos.filename.to_string_lossy().to_string(),
+            s,
+        ))
+    }
+    fn push_token(&mut self, t: Token) {
+        self.tokens.push(t)
+    }
+
+    fn get_tokens(&self) -> &Vec<Token> {
+        &self.tokens
+    }
+
+    fn get_last_token(&mut self) -> Option<&mut Token> {
+        self.tokens.last_mut()
     }
 }
 
@@ -399,21 +545,38 @@ mod tests {
     #[test]
     fn parse_num_test() {
         let l = Lexer::new();
-        let mut fp = create_temp_filelexer("23543 2123");
+        let mut fp = create_temp_filelexer("23543   2123\n  \"acbsd\"");
 
-        let expected = vec![Token {
-            tv: TokenTypeAndValue::Number(Num::ULongLongInt(23543)),
-            pos: Pos {
-                line: 0,
-                col: 0,
-                filename: fp.pos.filename.to_owned(),
+        let expected = vec![
+            Token {
+                tv: TokenTypeAndValue::Number(Num::ULongLongInt(23543)),
+                pos: Pos {
+                    line: 0,
+                    col: 0,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: true,
             },
-            whitespace_tail: false,
-        }];
-
-        for (act, exp) in l.parse(&mut fp).into_iter().zip(expected.into_iter()) {
-            assert_eq!(act, &exp)
-        }
+            Token {
+                tv: TokenTypeAndValue::Number(Num::ULongLongInt(2123)),
+                pos: Pos {
+                    line: 0,
+                    col: 8,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: true,
+            },
+            Token {
+                tv: TokenTypeAndValue::Str("acbsd".to_string()),
+                pos: Pos {
+                    line: 1,
+                    col: 3,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+        ];
+        assert_eq!(l.parse(&mut fp), &expected);
     }
     fn create_temp_filelexer(init_content: &str) -> FileLexer {
         let mut f1 = create_temp_file();
