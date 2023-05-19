@@ -24,6 +24,24 @@ macro_rules! lex_getc_if {
     };
 }
 
+macro_rules! make_token {
+    ($self:ident . $func:ident ($parser:ident $(, $params:expr)*) as $token_type: expr) => {
+        match $self.$func($parser, $( $params ),*) {
+            Err(e) => {
+                error!(
+                    "make {} token failed: {}",
+                    $token_type,
+                    $parser.error_string(e)
+                );
+                return None;
+            }
+            Ok(t) => {
+                return Some(t);
+            }
+        }
+    };
+}
+
 const KEYWORDS: [&str; 31] = [
     "unsigned",
     "signed",
@@ -121,10 +139,15 @@ trait LexParser {
 
     fn push_token(&mut self, t: Token);
     fn get_tokens(&self) -> &Vec<Token>;
-    fn get_last_token(&mut self) -> Option<&mut Token>;
+    fn get_last_token(&self) -> Option<&Token>;
+    fn get_last_token_mut(&mut self) -> Option<&mut Token>;
 
     fn error_string(&self, err: anyhow::Error) -> String;
     fn error(&self, s: &str) -> anyhow::Error;
+
+    // expression is content in parentheses
+    fn new_expression(&mut self);
+    fn is_in_expression(&self) -> bool;
 
     fn copy_position(&self) -> Pos;
 }
@@ -135,7 +158,6 @@ struct Lexer<'a> {
     // technically brackets are operator, but when we found a symbol ')' we known operator '('
     // done. that's why we put ')' in symbols
     operators_lead_char: HashSet<char>,
-    operators_as_one: HashSet<char>,
     operators_following_chars: HashSet<char>,
     operators_valid: HashSet<&'a str>,
     symbols: HashSet<char>,
@@ -148,8 +170,9 @@ struct FileLexer {
     output_file: File,
 
     pos: Pos,
+
     current_expression_count: usize,
-    parentheeses_buffer: String,
+    parentheses_buffer: String,
 
     tokens: Vec<Token>,
 }
@@ -162,30 +185,16 @@ impl<'a> Lexer<'a> {
             .map(|s| s.chars().next().expect("BUG: str in operators is empty"))
             .collect::<HashSet<char>>();
 
-        // lead chars which cannot be merged together; it retrieve from OPERATORS_VALID's char pairs which only
-        // shows in single char
-        let operators_as_one = operators_lead_char
-            .iter()
-            .map(|c| *c)
-            .filter(|c| {
-                //c not in a string which len > 2 in OPERATORS_VALID;
-                OPERATORS_VALID
-                    .into_iter()
-                    .filter(|st| st.len() > 1)
-                    .any(|st| st.chars().find(|stc| stc == c).is_some())
-            })
-            .collect::<HashSet<char>>();
-
         let operators_following_chars = OPERATORS_VALID
             .into_iter()
             .flat_map(|x| x.chars().skip(1))
             .collect::<HashSet<char>>();
+
         Self {
             keywords: HashSet::from(KEYWORDS),
 
             operators_valid: HashSet::from(OPERATORS_VALID),
             operators_lead_char,
-            operators_as_one,
             operators_following_chars,
 
             symbols: HashSet::from(SYMBOLS),
@@ -202,15 +211,7 @@ impl<'a> Lexer<'a> {
     fn next_token<T: LexParser>(&self, parser: &mut T) -> Option<Token> {
         if let Some(c) = parser.peek_char() {
             if Self::is_digit(c) {
-                match self.make_num_token(parser) {
-                    Err(e) => {
-                        error!("make num token failed: {}", parser.error_string(e));
-                        return None;
-                    }
-                    Ok(t) => {
-                        return Some(t);
-                    }
-                }
+                make_token!(self.make_num_token(parser) as "num")
             }
 
             if c.is_whitespace() {
@@ -218,19 +219,14 @@ impl<'a> Lexer<'a> {
             }
 
             if c == '"' {
-                match self.make_string_token(parser, '"', '"') {
-                    Err(e) => {
-                        error!("make string token failed: {}", parser.error_string(e));
-                        return None;
-                    }
-                    Ok(t) => {
-                        return Some(t);
-                    }
-                }
+                make_token!(self.make_string_token(parser, '"', '"') as "string")
             }
 
             if self.operators_lead_char.contains(&c) {
-                todo!()
+                make_token!(
+                    self.make_operator_or_string_token(parser) as
+                    "operator or string"
+                )
             }
         }
         None
@@ -278,28 +274,47 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    fn make_operator_token(&self, s: &str) -> Result<Token> {
-        unimplemented!()
+    // OR STRING means condition like #include <stdio.h>; we treat stdio.h as a string
+    fn make_operator_or_string_token<T: LexParser>(&self, parser: &mut T) -> Result<Token> {
+        let pos = parser.copy_position();
+        let op = self.read_op(parser)?;
+        if op == "<" {
+            if let Some(t) = parser.get_last_token() {
+                if Self::is_keyword(&t.tv, "include") && t.whitespace_tail == true {
+                    return self.make_string_token(parser, '<', '>');
+                }
+            }
+        }
+
+        // TODO: finish expression
+        if op == "(" {
+            parser.new_expression();
+        }
+
+        Ok(Token {
+            tv: TokenTypeAndValue::Operator(op),
+            pos,
+            whitespace_tail: false,
+        })
     }
 
-    fn read_op<T: LexParser>(&self, parser: &mut T) -> Result<Token> {
+    fn read_op<T: LexParser>(&self, parser: &mut T) -> Result<String> {
         let mut buf = String::new();
 
+        // check first char
         let op = parser
             .next_char()
             .expect("BUG: call read operator while encountering EOF");
-
         buf.write_char(op)?;
 
-        while !self.operators_as_one.contains(&op) {
-            let op = match parser.peek_char() {
-                Some(c) => c,
-                None => return Err(parser.error("invalid single char operator")),
-            };
-            if self.operators_following_chars.contains(&op) {
-                buf.write_char(op)?;
-                parser.next_char();
+        // check following chars
+        while let Some(op) = parser.peek_char() {
+            if !self.operators_following_chars.contains(&op) {
+                break;
             }
+
+            buf.write_char(op)?;
+            parser.next_char();
         }
 
         // push back the elems until operator is valid
@@ -325,11 +340,11 @@ impl<'a> Lexer<'a> {
             // i 是其他 表示有部分不满足被push回去了，但buf[:i]之间是满足的
             buf_str = &buf_str[..i];
         }
-        return self.make_operator_token(buf_str);
+        return Ok(buf_str.to_string());
     }
 
     fn handle_whitespace<T: LexParser>(&self, parser: &mut T) -> Option<Token> {
-        parser.get_last_token().map(|t| {
+        parser.get_last_token_mut().map(|t| {
             t.whitespace_tail = true;
         });
 
@@ -342,6 +357,10 @@ impl<'a> Lexer<'a> {
         }
 
         return self.next_token(parser);
+    }
+
+    fn is_keyword(token: &TokenTypeAndValue, content: &str) -> bool {
+        token == &TokenTypeAndValue::Keyword(content.to_string())
     }
 
     fn is_digit(c: char) -> bool {
@@ -370,7 +389,7 @@ impl FileLexer {
             },
 
             current_expression_count: 0,
-            parentheeses_buffer: String::new(),
+            parentheses_buffer: String::new(),
 
             tokens: Vec::new(),
         })
@@ -460,8 +479,23 @@ impl LexParser for FileLexer {
         &self.tokens
     }
 
-    fn get_last_token(&mut self) -> Option<&mut Token> {
+    fn get_last_token(&self) -> Option<&Token> {
+        self.tokens.last()
+    }
+
+    fn get_last_token_mut(&mut self) -> Option<&mut Token> {
         self.tokens.last_mut()
+    }
+
+    fn new_expression(&mut self) {
+        self.current_expression_count += 1;
+        if self.current_expression_count == 1 {
+            self.parentheses_buffer.clear();
+        }
+    }
+
+    fn is_in_expression(&self) -> bool {
+        self.current_expression_count > 0
     }
 }
 
@@ -543,7 +577,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_num_test() {
+    fn operators_test() {
+        let l = Lexer::new();
+        assert_eq!(
+            l.operators_lead_char,
+            HashSet::from([
+                '|', '(', '?', '^', '<', '/', '[', '.', '-', ',', '=', '*', '>', '~', '!', '+',
+                '%', '&'
+            ],)
+        );
+        assert_eq!(
+            l.operators_following_chars,
+            HashSet::from(['-', '+', '&', '|', '>', '<', '='])
+        );
+    }
+    #[test]
+    fn parse_num_and_string_test() {
         let l = Lexer::new();
         let mut fp = create_temp_filelexer("23543   2123\n  \"acbsd\"");
 
@@ -578,6 +627,44 @@ mod tests {
         ];
         assert_eq!(l.parse(&mut fp), &expected);
     }
+
+    #[test]
+    fn parse_operator_test() {
+        let l = Lexer::new();
+        let mut fp = create_temp_filelexer("3+2");
+
+        let expected = vec![
+            Token {
+                tv: TokenTypeAndValue::Number(Num::ULongLongInt(3)),
+                pos: Pos {
+                    line: 0,
+                    col: 0,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+            Token {
+                tv: TokenTypeAndValue::Operator("+".to_string()),
+                pos: Pos {
+                    line: 0,
+                    col: 1,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+            Token {
+                tv: TokenTypeAndValue::Number(Num::ULongLongInt(2)),
+                pos: Pos {
+                    line: 0,
+                    col: 2,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+        ];
+        assert_eq!(l.parse(&mut fp), &expected);
+    }
+
     fn create_temp_filelexer(init_content: &str) -> FileLexer {
         let mut f1 = create_temp_file();
         let f2 = create_temp_file();
