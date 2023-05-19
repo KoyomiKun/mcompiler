@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use log::error;
+use log::{debug, error};
 
 // get the last char and write to buffer and delete it if condition satisfied
 macro_rules! lex_getc_if {
@@ -147,6 +147,7 @@ trait LexParser {
 
     // expression is content in parentheses
     fn new_expression(&mut self);
+    fn end_expression(&mut self) -> Result<()>;
     fn is_in_expression(&self) -> bool;
 
     fn copy_position(&self) -> Pos;
@@ -171,7 +172,7 @@ struct FileLexer {
 
     pos: Pos,
 
-    current_expression_count: usize,
+    current_expression_count: isize,
     parentheses_buffer: String,
 
     tokens: Vec<Token>,
@@ -210,10 +211,15 @@ impl<'a> Lexer<'a> {
 
     fn next_token<T: LexParser>(&self, parser: &mut T) -> Option<Token> {
         if let Some(c) = parser.peek_char() {
+            debug!("peek char {c}");
             if Self::is_digit(c) {
                 make_token!(self.make_num_token(parser) as "num")
             }
 
+            // judge \n first or it will be recognized as a whitespace
+            if c == '\n' {
+                make_token!(self.make_newline_token(parser) as "newline")
+            }
             if c.is_whitespace() {
                 return self.handle_whitespace(parser);
             }
@@ -228,8 +234,69 @@ impl<'a> Lexer<'a> {
                     "operator or string"
                 )
             }
+
+            if self.symbols.contains(&c) {
+                make_token!(self.make_symbol_token(parser) as "symbol")
+            }
+
+            if c == '_' || c.is_ascii_alphabetic() {
+                make_token!(self.make_identifier_or_keyword_token(parser) as "identifier or keyword")
+            }
+
+            error!("{}", parser.error("unexpected token"));
         }
+
         None
+    }
+
+    fn make_newline_token<T: LexParser>(&self, parser: &mut T) -> Result<Token> {
+        let p = parser.copy_position();
+        parser.next_char();
+        Ok(Token {
+            tv: TokenTypeAndValue::Newline,
+            pos: p,
+            whitespace_tail: false,
+        })
+    }
+
+    fn make_identifier_or_keyword_token<T: LexParser>(&self, parser: &mut T) -> Result<Token> {
+        let p = parser.copy_position();
+        let mut buffer = String::new();
+
+        lex_getc_if!(parser, Self::is_identifier, buffer);
+
+        // if is keyword
+        if self.keywords.contains(buffer.as_str()) {
+            return Ok(Token {
+                tv: TokenTypeAndValue::Keyword(buffer),
+                pos: p,
+                whitespace_tail: false,
+            });
+        }
+
+        Ok(Token {
+            tv: TokenTypeAndValue::Identifier(buffer),
+            pos: p,
+            whitespace_tail: false,
+        })
+    }
+
+    fn make_symbol_token<T: LexParser>(&self, parser: &mut T) -> Result<Token> {
+        let p = parser.copy_position();
+        let c = parser
+            .next_char()
+            .expect("BUG: make symbol token while parsed content is empty");
+        if c == ')' {
+            parser
+                .end_expression()
+                .map_err(|e| anyhow!(parser.error_string(e)))?;
+        }
+
+        Ok(Token {
+            tv: TokenTypeAndValue::Symbol(c),
+            pos: p,
+            whitespace_tail: false,
+        })
     }
 
     // parse 42314
@@ -494,6 +561,14 @@ impl LexParser for FileLexer {
         }
     }
 
+    fn end_expression(&mut self) -> Result<()> {
+        self.current_expression_count -= 1;
+        if self.current_expression_count < 0 {
+            return Err(anyhow!("you close an expression which you never opened"));
+        }
+        Ok(())
+    }
+
     fn is_in_expression(&self) -> bool {
         self.current_expression_count > 0
     }
@@ -594,7 +669,7 @@ mod tests {
     #[test]
     fn parse_num_and_string_test() {
         let l = Lexer::new();
-        let mut fp = create_temp_filelexer("23543   2123\n  \"acbsd\"");
+        let mut fp = create_temp_filelexer("23543   2123  \"acbsd\"");
 
         let expected = vec![
             Token {
@@ -618,8 +693,8 @@ mod tests {
             Token {
                 tv: TokenTypeAndValue::Str("acbsd".to_string()),
                 pos: Pos {
-                    line: 1,
-                    col: 3,
+                    line: 0,
+                    col: 15,
                     filename: fp.pos.filename.to_owned(),
                 },
                 whitespace_tail: false,
@@ -629,9 +704,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_operator_test() {
+    fn parse_operator_and_symbol_test() {
         let l = Lexer::new();
-        let mut fp = create_temp_filelexer("3+2");
+        let mut fp = create_temp_filelexer("3+2++(50)");
 
         let expected = vec![
             Token {
@@ -657,6 +732,89 @@ mod tests {
                 pos: Pos {
                     line: 0,
                     col: 2,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+            Token {
+                tv: TokenTypeAndValue::Operator("++".to_string()),
+                pos: Pos {
+                    line: 0,
+                    col: 3,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+            Token {
+                tv: TokenTypeAndValue::Operator("(".to_string()),
+                pos: Pos {
+                    line: 0,
+                    col: 5,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+            Token {
+                tv: TokenTypeAndValue::Number(Num::ULongLongInt(50)),
+                pos: Pos {
+                    line: 0,
+                    col: 6,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+            Token {
+                tv: TokenTypeAndValue::Symbol(')'),
+                pos: Pos {
+                    line: 0,
+                    col: 8,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+        ];
+        assert_eq!(l.parse(&mut fp), &expected);
+    }
+
+    #[test]
+    fn parse_identifier_or_keyword_or_newline_test() {
+        env_logger::init();
+        let l = Lexer::new();
+        let mut fp = create_temp_filelexer("gewa __ignore_typecheck__ week\n");
+
+        let expected = vec![
+            Token {
+                tv: TokenTypeAndValue::Identifier("gewa".to_string()),
+                pos: Pos {
+                    line: 0,
+                    col: 0,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: true,
+            },
+            Token {
+                tv: TokenTypeAndValue::Keyword("__ignore_typecheck__".to_string()),
+                pos: Pos {
+                    line: 0,
+                    col: 5,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: true,
+            },
+            Token {
+                tv: TokenTypeAndValue::Identifier("week".to_string()),
+                pos: Pos {
+                    line: 0,
+                    col: 26,
+                    filename: fp.pos.filename.to_owned(),
+                },
+                whitespace_tail: false,
+            },
+            Token {
+                tv: TokenTypeAndValue::Newline,
+                pos: Pos {
+                    line: 0,
+                    col: 30,
                     filename: fp.pos.filename.to_owned(),
                 },
                 whitespace_tail: false,
